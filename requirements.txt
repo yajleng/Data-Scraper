@@ -1,0 +1,10 @@
+flask
+requests
+beautifulsoup4
+lxml
+pandas==2.2.3
+numpy==1.26.4
+gunicorn
+requests-html==0.10.0
+pyppeteer==1.0.2
+lxml_html_clean
