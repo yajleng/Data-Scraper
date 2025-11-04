@@ -1,243 +1,183 @@
+# file: main.py
 import os
+import sys
 import time
+import types
+from typing import Any, Dict
 from flask import Flask, jsonify, request
 
-# Core modules
-from modules.cfb_data import get_cfbd_team
-from modules.cfb_batch import update_weekly_cache, read_from_cache, get_team_from_cache
-
-# New modules
-from modules.weather_openmeteo import get_weather, get_hourly_kickoff_window
-from modules.odds_totals import get_odds_totals
-from modules.tempo_plays import get_tempo
-from modules.injuries_scraper import get_injuries
-
+# Import ONLY modules that exist in the repo you uploaded
+from modules.cfb_data import get_cfbd_team, get_lines
 from modules.cfb_matchup import get_team_matchup
-from modules.cfb_lines import get_historical_lines
 from modules.cfb_power_ratings import get_massey_ratings
-from modules.odds_history import get_odds_history
-
-from modules.massey_scraper import fetch_massey_ratings
+from modules.weather_openmeteo import get_weather, get_kickoff_window
+from modules.spread_engine import calculate_spread_edge
 
 app = Flask(__name__)
 
-# -----------------------------------------------------------
-# ROOT
-# -----------------------------------------------------------
-@app.route("/")
-def home():
-    return jsonify({
-        "message": "CFB weekly cache service (batch + normalization)",
-        "endpoints": {
-            "admin_update": "/admin/cfb/update?year=2025&week=10",
-            "cache_info": "/cfb/cache?year=2025&week=10",
-            "team": "/cfb/team?name=Georgia&year=2025&week=10",
-            "fetch_team_alias": "/fetch/cfb/team?name=Georgia&year=2025&week=10",
-            "weather": "/cfb/weather?lat=33.94&lon=-83.37",
-            "weather_hourly": "/cfb/weather/hourly?lat=33.94&lon=-83.37&kickoff=2025-11-01T23:00Z",
-            "odds": "/cfb/odds?year=2025&week=10",
-            "tempo": "/cfb/tempo?team=Georgia",
-            "injuries": "/cfb/injuries?team=georgia",
-            "matchup": "/cfb/matchup?team1=Georgia&team2=Alabama&year=2025",
-            "lines": "/cfb/lines?year=2025&week=10",
-            "ratings": "/cfb/ratings",
-            "odds_history": "/cfb/odds/history?date=2025-11-01",
-            "health": "/health"
-        },
-        "status": "ok"
-    })
+# --------- helpers ---------
+def err(msg: str, code: int = 400):
+    """Uniform JSON errors (why: consistent client handling)."""
+    return jsonify({"error": msg}), code
 
-# -----------------------------------------------------------
-# ADMIN: Update & Cache
-# -----------------------------------------------------------
-@app.route("/admin/cfb/update")
-def admin_update():
-    try:
-        year = int(request.args.get("year", 2025))
-        week = int(request.args.get("week", 10))
-    except ValueError:
-        return jsonify({"error": "year/week must be integers"}), 400
-    result = update_weekly_cache(year, week)
-    return jsonify(result)
+def require_params(d: Dict[str, Any], *names: str):
+    missing = [n for n in names if d.get(n) in (None, "")]
+    if missing:
+        return f"missing required params: {', '.join(missing)}"
+    return None
 
-# -----------------------------------------------------------
-# CACHE READ
-# -----------------------------------------------------------
-@app.route("/cfb/cache")
-def cache_info():
-    try:
-        year = int(request.args.get("year", 2025))
-        week = int(request.args.get("week", 10))
-    except ValueError:
-        return jsonify({"error": "year/week must be integers"}), 400
-    return jsonify(read_from_cache(year, week))
+def _install_cache_shim():
+    """
+    If modules.cache_utils is absent, provide a tiny in-memory shim so
+    modules/tempo_plays.py and modules/injuries_scraper.py can import.
+    Why: your ZIP excluded cache_utils; this prevents ImportError.
+    """
+    if "modules.cache_utils" in sys.modules:
+        return
+    cache: Dict[str, Any] = {}
+    mod = types.ModuleType("modules.cache_utils")
+    def load_cache(key: str):
+        return cache.get(key)
+    def save_cache(key: str, value: Any, *args, **kwargs):
+        cache[key] = value
+    mod.load_cache = load_cache
+    mod.save_cache = save_cache
+    sys.modules["modules.cache_utils"] = mod
 
-# -----------------------------------------------------------
-# TEAM STATS (from cache)
-# -----------------------------------------------------------
-@app.route("/cfb/team")
-def cfb_team():
-    name = request.args.get("name", "")
-    try:
-        year = int(request.args.get("year", 2025))
-        week = int(request.args.get("week", 10))
-    except ValueError:
-        return jsonify({"error": "year/week must be integers"}), 400
-    if not name:
-        return jsonify({"error": "missing ?name="}), 400
-    return jsonify(get_team_from_cache(year, week, name))
-
-@app.route("/fetch/cfb/team")
-def fetch_cfb_team_alias():
-    return cfb_team()
-
-# -----------------------------------------------------------
-# WEATHER (Open-Meteo)
-# -----------------------------------------------------------
-@app.route("/cfb/weather")
-def cfb_weather():
-    lat = request.args.get("lat")
-    lon = request.args.get("lon")
-    if not lat or not lon:
-        return jsonify({"error": "missing lat/lon parameters"}), 400
-    try:
-        lat = float(lat)
-        lon = float(lon)
-    except ValueError:
-        return jsonify({"error": "lat/lon must be numeric"}), 400
-    return jsonify(get_weather(lat, lon))
-
-# -----------------------------------------------------------
-# WEATHER HOURLY KICKOFF WINDOW
-# -----------------------------------------------------------
-@app.route("/cfb/weather/hourly")
-def cfb_weather_hourly():
-    try:
-        lat = float(request.args.get("lat"))
-        lon = float(request.args.get("lon"))
-        kickoff = request.args.get("kickoff", "2025-11-01T23:00Z")
-        data = get_hourly_kickoff_window(lat, lon, kickoff)
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": f"hourly weather failed: {str(e)}"}), 500
-
-# -----------------------------------------------------------
-# ODDS / TOTALS (TheOddsAPI)
-# -----------------------------------------------------------
-@app.route("/cfb/odds")
-def cfb_odds():
-    year = request.args.get("year", 2025)
-    week = request.args.get("week", 10)
-    try:
-        data = get_odds_totals(week, year)
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({
-            "error": f"Failed to fetch odds: {str(e)}",
-            "note": "If TheOddsAPI free tier was exceeded, recheck your API key or add a fallback cache."
-        }), 500
-
-# -----------------------------------------------------------
-# TEMPO / DRIVE PACE
-# -----------------------------------------------------------
-@app.route("/cfb/tempo")
-def cfb_tempo():
-    team = request.args.get("team")
-    if not team:
-        return jsonify({"error": "missing ?team="}), 400
-    try:
-        data = get_tempo(team)
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": f"tempo fetch failed: {str(e)}"}), 500
-
-# -----------------------------------------------------------
-# INJURIES (ESPN scrape)
-# -----------------------------------------------------------
-@app.route("/cfb/injuries")
-def cfb_injuries():
-    team = request.args.get("team")
-    if not team:
-        return jsonify({"error": "missing ?team="}), 400
-    try:
-        data = get_injuries(team)
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": f"injury scrape failed: {str(e)}"}), 500
-
-# -----------------------------------------------------------
-# CFB TEAM MATCHUP (CFBD /teams/matchup)
-# -----------------------------------------------------------
-@app.route("/cfb/matchup")
-def cfb_matchup():
-    team1 = request.args.get("team1")
-    team2 = request.args.get("team2")
-    year = int(request.args.get("year", 2025))
-    if not team1 or not team2:
-        return jsonify({"error": "missing ?team1= and ?team2="}), 400
-    try:
-        return jsonify(get_team_matchup(team1, team2, year))
-    except Exception as e:
-        return jsonify({"error": f"matchup fetch failed: {str(e)}"}), 500
-
-# -----------------------------------------------------------
-# CFB HISTORICAL LINES (CFBD /lines)
-# -----------------------------------------------------------
-@app.route("/cfb/lines")
-def cfb_lines():
-    try:
-        year = int(request.args.get("year", 2025))
-        week = int(request.args.get("week", 10))
-        data = get_historical_lines(year, week)
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": f"lines fetch failed: {str(e)}"}), 500
-
-# -----------------------------------------------------------
-# MASSEY POWER RATINGS (scrape)
-# -----------------------------------------------------------
-@app.route("/cfb/ratings")
-def cfb_ratings():
-    try:
-        return jsonify(fetch_massey_ratings())
-    except Exception as e:
-        return jsonify({"error": f"ratings fetch failed: {str(e)}"}), 500
-
-# -----------------------------------------------------------
-# PUBLIC ODDS HISTORY (OddsAPI)
-# -----------------------------------------------------------
-@app.route("/cfb/odds/history")
-def cfb_odds_history():
-    date = request.args.get("date", "2025-11-01")
-    try:
-        data = get_odds_history(date)
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": f"odds history fetch failed: {str(e)}"}), 500
-
-@app.get("/cache/list")
-def list_cache_files():
-    files = [f for f in os.listdir("cache") if f.endswith(".json")]
-    return {"count": len(files), "files": files}
-
-@app.get("/cache/read")
-def read_cache_file(filename: str):
-    path = os.path.join("cache", filename)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Cache file not found")
-    with open(path) as f:
-        return json.load(f)
-
-# -----------------------------------------------------------
-# HEALTH CHECK
-# -----------------------------------------------------------
+# --------- health ---------
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "ts": int(time.time())})
 
-# -----------------------------------------------------------
-# RUN SERVER
-# -----------------------------------------------------------
+# --------- CFB: team info ---------
+@app.route("/cfb/team")
+def cfb_team():
+    team = request.args.get("team")
+    if not team:
+        return err("param 'team' is required")
+    try:
+        return jsonify(get_cfbd_team(team))
+    except Exception as e:
+        return err(f"team lookup failed: {e}", 500)
+
+# --------- CFB: lines (placeholder wrapper in your repo) ---------
+@app.route("/cfb/lines")
+def cfb_lines():
+    params_error = require_params(request.args, "team", "year", "week")
+    if params_error:
+        return err(params_error)
+    team = request.args["team"]
+    try:
+        year = int(request.args["year"])
+        week = int(request.args["week"])
+    except ValueError:
+        return err("params 'year' and 'week' must be integers")
+    try:
+        return jsonify(get_lines(team, year, week))
+    except Exception as e:
+        return err(f"lines fetch failed: {e}", 500)
+
+# --------- CFB: matchup ---------
+@app.route("/cfb/matchup")
+def cfb_matchup():
+    params_error = require_params(request.args, "team1", "team2", "year")
+    if params_error:
+        return err(params_error)
+    team1 = request.args["team1"]
+    team2 = request.args["team2"]
+    try:
+        year = int(request.args["year"])
+    except ValueError:
+        return err("param 'year' must be an integer")
+    try:
+        return jsonify(get_team_matchup(team1, team2, year))
+    except Exception as e:
+        return err(f"matchup fetch failed: {e}", 500)
+
+# --------- CFB: power ratings (Massey) ---------
+@app.route("/cfb/power/massey")
+def cfb_power_massey():
+    try:
+        return jsonify(get_massey_ratings())
+    except Exception as e:
+        return err(f"massey ratings failed: {e}", 500)
+
+# --------- Weather (Open-Meteo) ---------
+@app.route("/cfb/weather")
+def cfb_weather():
+    params_error = require_params(request.args, "lat", "lon")
+    if params_error:
+        return err(params_error)
+    try:
+        lat = float(request.args["lat"])
+        lon = float(request.args["lon"])
+    except ValueError:
+        return err("params 'lat' and 'lon' must be numeric")
+    try:
+        return jsonify(get_weather(lat, lon))
+    except Exception as e:
+        return err(f"weather fetch failed: {e}", 500)
+
+@app.route("/cfb/weather/kickoff")
+def cfb_weather_kickoff():
+    params_error = require_params(request.args, "lat", "lon", "kickoff")
+    if params_error:
+        return err(params_error)
+    try:
+        lat = float(request.args["lat"])
+        lon = float(request.args["lon"])
+    except ValueError:
+        return err("params 'lat' and 'lon' must be numeric")
+    kickoff = request.args["kickoff"]
+    try:
+        return jsonify(get_kickoff_window(lat, lon, kickoff))
+    except Exception as e:
+        return err(f"kickoff window fetch failed: {e}", 500)
+
+# --------- Spread engine (toy) ---------
+@app.route("/cfb/spread/edge")
+def cfb_spread_edge():
+    params_error = require_params(request.args, "team_sp", "opp_sp", "line")
+    if params_error:
+        return err(params_error)
+    try:
+        team_sp = float(request.args["team_sp"])
+        opp_sp  = float(request.args["opp_sp"])
+        line    = float(request.args["line"])
+    except ValueError:
+        return err("params 'team_sp', 'opp_sp', and 'line' must be numeric")
+    try:
+        return jsonify(calculate_spread_edge(team_sp, opp_sp, line))
+    except Exception as e:
+        return err(f"edge calc failed: {e}", 500)
+
+# --------- Injuries (lazy import due to missing cache_utils) ---------
+@app.route("/cfb/injuries")
+def cfb_injuries():
+    team = request.args.get("team")
+    if not team:
+        return err("param 'team' is required")
+    try:
+        _install_cache_shim()
+        from modules.injuries_scraper import get_injuries  # import here to avoid startup failure
+        return jsonify(get_injuries(team))
+    except Exception as e:
+        return err(f"injuries fetch failed: {e}", 500)
+
+# --------- Tempo (lazy import due to missing cache_utils) ---------
+@app.route("/cfb/tempo")
+def cfb_tempo():
+    team = request.args.get("team")
+    if not team:
+        return err("param 'team' is required")
+    try:
+        _install_cache_shim()
+        from modules.tempo_plays import get_tempo  # import here to avoid startup failure
+        return jsonify(get_tempo(team))
+    except Exception as e:
+        return err(f"tempo fetch failed: {e}", 500)
+
+# --------- run ---------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
